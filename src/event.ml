@@ -68,6 +68,25 @@ module Location = struct
 end
 
 module Ok = struct
+  module Pebs_data = struct
+    type data_source =
+      | L1_hit
+      | L2_hit
+      | L3_hit
+      | Local_dram
+      | Remote_dram
+      | Unknown
+    [@@deriving sexp, bin_io]
+
+    type t =
+      { latency_cycles : int option
+      ; data_source : data_source option
+      ; memory_address : Int64.Hex.t option
+      ; physical_address : Int64.Hex.t option
+      }
+    [@@deriving sexp, bin_io]
+  end
+
   module Data = struct
     type t =
       | Trace of
@@ -82,6 +101,7 @@ module Ok = struct
           { location : Location.t
           ; count : int
           ; name : Collection_mode.Event.Name.t
+          ; pebs_data : Pebs_data.t option [@sexp.option]
           }
     [@@deriving sexp, bin_io]
   end

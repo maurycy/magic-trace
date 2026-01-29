@@ -5,6 +5,8 @@ module Event : sig
     type t =
       | Branch_misses
       | Cache_misses
+      | Mem_loads
+      | Mem_stores
     [@@deriving compare, hash, sexp, bin_io]
 
     val to_string : t -> string

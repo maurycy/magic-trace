@@ -5,11 +5,15 @@ module Event = struct
     type t =
       | Branch_misses
       | Cache_misses
+      | Mem_loads
+      | Mem_stores
     [@@deriving compare, hash, sexp, bin_io]
 
     let to_string = function
       | Branch_misses -> "branch-misses"
       | Cache_misses -> "cache-misses"
+      | Mem_loads -> "mem_inst_retired.all_loads"
+      | Mem_stores -> "mem_inst_retired.all_stores"
     ;;
   end
 
@@ -42,6 +46,10 @@ module Event = struct
       { when_to_sample = Period 50; name = Branch_misses; precision = Maximum_possible }
     | "cache-misses" ->
       { when_to_sample = Period 1; name = Cache_misses; precision = Maximum_possible }
+    | "mem-loads" ->
+      { when_to_sample = Period 1000; name = Mem_loads; precision = Maximum_possible }
+    | "mem-stores" ->
+      { when_to_sample = Period 1000; name = Mem_stores; precision = Maximum_possible }
     | str -> t_of_sexp (Sexp.of_string str)
   ;;
 
@@ -78,8 +86,8 @@ let param =
          (Command.Arg_type.comma_separated ~unique_values:true Event.arg_type))
       ~doc:
         "EVENTS Select additional events which can be sampled as a comma separated list. \
-         Valid options are [cache-misses] or [branch-misses]. For more info: \
-         https://magic-trace.org/w/e"
+         Valid options are [cache-misses], [branch-misses], [mem-loads], or [mem-stores]. \
+         For more info: https://magic-trace.org/w/e"
     |> Util.experimental_flag ~default:[]
   and use_sampling =
     flag

@@ -88,6 +88,32 @@ let supports_tracing_kernel () =
   Int.(Core_unix.geteuid () = 0)
 ;;
 
+let can_collect_phys_addr =
+  lazy
+    ((* CAP_SYS_ADMIN or root or perf_event_paranoid <= 0 *)
+     Int.(Core_unix.geteuid () = 0)
+     ||
+     try
+       let paranoid =
+         In_channel.read_all "/proc/sys/kernel/perf_event_paranoid"
+         |> String.strip
+         |> Int.of_string
+       in
+       Int.(paranoid <= 0)
+     with
+     | _ -> false)
+;;
+
+(* Detect hybrid CPUs (Intel Alder Lake and later) which have separate PMUs for
+   P-cores (cpu_core) and E-cores (cpu_atom). PEBS events on hybrid CPUs require
+   explicit PMU specification. *)
+let is_hybrid_cpu =
+  lazy
+    (match Core_unix.access "/sys/bus/event_source/devices/cpu_core" [ `Exists ] with
+     | Ok () -> true
+     | Error _ -> false)
+;;
+
 let kernel_version_at_least ~major ~minor version =
   Int.(Version.compare version (Version.create ~major ~minor) >= 0)
 ;;

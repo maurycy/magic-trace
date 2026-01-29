@@ -1051,13 +1051,37 @@ and write_event' (T t) ?events_writer event =
     (match event_value with
      | { Event.Ok.thread = _
        ; time = _
-       ; data = Event_sample { location; count; name }
+       ; data = Event_sample { location; count; name; pebs_data }
        ; in_transaction = _
        } ->
        let track_name = Collection_mode.Event.Name.to_string name in
        let track_thread =
          Hashtbl.find_or_add thread_info.extra_event_tracks name ~default:(fun () ->
            allocate_thread t ~pid:thread_info.track_group_id ~name:track_name)
+       in
+       let pebs_args =
+         match pebs_data with
+         | None -> []
+         | Some { latency_cycles; data_source; memory_address; physical_address } ->
+           let data_source_to_string : Event.Ok.Pebs_data.data_source -> string = function
+             | L1_hit -> "L1"
+             | L2_hit -> "L2"
+             | L3_hit -> "L3"
+             | Local_dram -> "Local DRAM"
+             | Remote_dram -> "Remote DRAM"
+             | Unknown -> "Unknown"
+           in
+           Tracing.Trace.Arg.(
+             List.concat
+               [ Option.value_map latency_cycles ~default:[] ~f:(fun lat ->
+                   [ "latency_cycles", Int lat ])
+               ; Option.value_map data_source ~default:[] ~f:(fun ds ->
+                   [ "data_source", String (data_source_to_string ds) ])
+               ; Option.value_map memory_address ~default:[] ~f:(fun addr ->
+                   [ "mem_addr", Pointer addr ])
+               ; Option.value_map physical_address ~default:[] ~f:(fun addr ->
+                   [ "phys_addr", Pointer addr ])
+               ])
        in
        let args =
          Tracing.Trace.Arg.(
@@ -1074,6 +1098,7 @@ and write_event' (T t) ?events_writer event =
                  (Event.thread outer_event).pid
                  ~f:(fun pid -> [ "tid", Int (Pid.to_int pid) ])
                  ~default:[]
+             ; pebs_args
              ])
        in
        write_duration_complete

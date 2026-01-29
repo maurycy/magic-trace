@@ -284,6 +284,7 @@ module Recording = struct
   ;;
 
   let perf_config_of_extra_events ~selector extra_events =
+    let is_hybrid = Lazy.force Perf_capabilities.is_hybrid_cpu in
     List.map
       extra_events
       ~f:(fun ({ when_to_sample; name; precision } : Collection_mode.Event.t) ->
@@ -295,13 +296,28 @@ module Recording = struct
           | Zero_skid -> "ppp"
           | Maximum_possible -> "P"
         in
-        match when_to_sample with
-        | Period period ->
+        let event_name = Collection_mode.Event.Name.to_string name in
+        (* For PEBS events (mem-loads, mem-stores) on hybrid CPUs, we need to use
+           the cpu_core PMU prefix and comma-based period syntax:
+           cpu_core/mem_inst_retired.all_loads,period=N/uP *)
+        let needs_pmu_prefix =
+          is_hybrid
+          &&
+          match name with
+          | Mem_loads | Mem_stores -> true
+          | Branch_misses | Cache_misses -> false
+        in
+        match when_to_sample, needs_pmu_prefix with
+        | Period period, true ->
           [%string
-            "%{name#Collection_mode.Event.Name}/period=%{period#Int}/%{selector}%{precision_selector}"]
-        | Frequency freq ->
+            "cpu_core/%{event_name},period=%{period#Int}/%{selector}%{precision_selector}"]
+        | Period period, false ->
+          [%string "%{event_name}/period=%{period#Int}/%{selector}%{precision_selector}"]
+        | Frequency freq, true ->
           [%string
-            "%{name#Collection_mode.Event.Name}/freq=%{freq#Int}/%{selector}%{precision_selector}"])
+            "cpu_core/%{event_name},freq=%{freq#Int}/%{selector}%{precision_selector}"]
+        | Frequency freq, false ->
+          [%string "%{event_name}/freq=%{freq#Int}/%{selector}%{precision_selector}"])
   ;;
 
   let perf_args_of_collection_mode
@@ -469,6 +485,21 @@ module Recording = struct
              %!";
           [])
     in
+    (* PEBS events require --data (for memory addresses) and -W (for latency/weight).
+       If running as root or with perf_event_paranoid <= 0, also collect physical addresses. *)
+    let pebs_opts =
+      let has_pebs_events =
+        List.exists (Collection_mode.extra_events collection_mode) ~f:(fun ev ->
+          match ev.name with
+          | Mem_loads | Mem_stores -> true
+          | Branch_misses | Cache_misses -> false)
+      in
+      if has_pebs_events
+      then (
+        let can_phys = Lazy.force Perf_capabilities.can_collect_phys_addr in
+        if can_phys then [ "--data"; "-W"; "--phys-data" ] else [ "--data"; "-W" ])
+      else []
+    in
     let snapshot_size_opt =
       match snapshot_size, collection_mode with
       | Some snapshot_size, Intel_processor_trace _ ->
@@ -515,6 +546,7 @@ module Recording = struct
         ; control_opt
         ; kcore_opts
         ; snapshot_size_opt
+        ; pebs_opts
         ; Callgraph_mode.to_perf_record_args selected_callgraph_mode
         ]
     in
@@ -609,11 +641,32 @@ let decode_events
         | Intel_processor_trace _ -> [ "--itrace=bep" ]
         | Stacktrace_sampling _ -> []
       in
+      let has_pebs_events =
+        List.exists (Collection_mode.extra_events collection_mode) ~f:(fun ev ->
+          match ev.name with
+          | Mem_loads | Mem_stores -> true
+          | Branch_misses | Cache_misses -> false)
+      in
+      let pebs_fields =
+        if has_pebs_events
+        then (
+          let can_phys = Lazy.force Perf_capabilities.can_collect_phys_addr in
+          let phys_field = if can_phys then ",phys_addr" else "" in
+          (* Note: addr field is needed for PEBS memory address; weight for latency;
+             data_src for cache level info; phys_addr for physical address if privileged *)
+          [%string ",addr,weight,data_src%{phys_field}"])
+        else ""
+      in
       let fields_opts =
         match collection_mode with
         | Intel_processor_trace _ ->
-          [ "-F"; "pid,tid,time,flags,ip,addr,sym,symoff,synth,dso,event,period" ]
-        | Stacktrace_sampling _ -> [ "-F"; "pid,tid,time,ip,sym,symoff,dso,event,period" ]
+          [ "-F"
+          ; [%string "pid,tid,time,flags,ip,addr,sym,symoff,synth,dso,event,period%{pebs_fields}"]
+          ]
+        | Stacktrace_sampling _ ->
+          [ "-F"
+          ; [%string "pid,tid,time,ip,sym,symoff,dso,event,period%{pebs_fields}"]
+          ]
       in
       let args =
         List.concat

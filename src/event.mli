@@ -38,6 +38,25 @@ module Location : sig
 end
 
 module Ok : sig
+  module Pebs_data : sig
+    type data_source =
+      | L1_hit
+      | L2_hit
+      | L3_hit
+      | Local_dram
+      | Remote_dram
+      | Unknown
+    [@@deriving sexp]
+
+    type t =
+      { latency_cycles : int option
+      ; data_source : data_source option
+      ; memory_address : int64 option
+      ; physical_address : int64 option
+      }
+    [@@deriving sexp]
+  end
+
   module Data : sig
     type t =
       | Trace of
@@ -54,6 +73,7 @@ module Ok : sig
           { location : Location.t
           ; count : int
           ; name : Collection_mode.Event.Name.t
+          ; pebs_data : Pebs_data.t option
           } (** Represents counter based events collected through sampling. *)
     [@@deriving sexp]
   end

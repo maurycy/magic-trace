@@ -9,7 +9,7 @@ let saturating_sub_i64 a b =
 
 let perf_event_header_re =
   Re.Perl.re
-    {|^ *([0-9]+)/([0-9]+) +([0-9]+)\.([0-9]+): +([0-9]+) +([a-z\-]+)(/[a-z=0-9]+)?(/[a-zA-Z]*)?:([a-zA-Z]+:)?(.*)$|}
+    {|^ *([0-9]+)/([0-9]+) +([0-9]+)\.([0-9]+): +([0-9]+) +([a-z\-_\.]+)(/[a-z=0-9\._,]+)?(/[a-zA-Z]*)?:([a-zA-Z]+:)?(.*)$|}
   |> Re.compile
 ;;
 
@@ -38,13 +38,91 @@ let trace_error_re =
 let symbol_and_offset_re = Re.Perl.re {|^(.*)\+(0x[0-9a-f]+)\s+\(.*\)$|} |> Re.compile
 let unknown_symbol_dso_re = Re.Perl.re {|^\[unknown\]\s+\((.*)\)|} |> Re.compile
 
+(* PEBS fields: addr, data_src, weight, ip, symbol, and optionally phys_addr
+   Format from perf script (positional, not labeled):
+   addr  data_src  |OP X|LVL Y|SNP Z|TLB W|LCK V|BLK U   weight ins_lat retire_lat  ip  sym+off (dso)  [phys_addr]
+   Example:
+   7f01de205f28  1e05080022 |OP LOAD|LVL N/A|...|BLK  N/A  0  0  0  7f01de1ede8a _dl_start+0x9a (/lib/...) [1c08609f28]
+
+   Note: The pipe fields have the format |KEY VALUE| for all but the last one which is just
+   KEY  VALUE (extra space, no trailing pipe). Each field is separated by |.
+
+   Groups:
+   1: addr (memory address)
+   2: data_src (data source hex)
+   3: weight (latency cycles)
+   4: ip (instruction pointer)
+   5: symbol+offset (dso)
+   6: phys_addr (optional)
+*)
+let perf_pebs_line_re =
+  Re.Perl.re
+    {|^ *([0-9a-f]+) +([0-9a-f]+) +\|[^|]+\|[^|]+\|[^|]+\|[^|]+\|[^|]+\|[A-Z]+[ ]+[^ ]+ +([0-9]+)(?: +[0-9]+)?(?: +[0-9]+)? +([0-9a-f]+) +([^ ]+ +\([^)]+\))(?: +([0-9a-f]+))?$|}
+  |> Re.compile
+;;
+
+let decode_data_source (data_src : int64) : Event.Ok.Pebs_data.data_source =
+  (* PERF_MEM_LVL_* bits from linux/perf_event.h:
+     LVL_L1 = 0x08, LVL_LFB = 0x10, LVL_L2 = 0x20, LVL_L3 = 0x40,
+     LVL_LOC_RAM = 0x80, LVL_REM_RAM1 = 0x100, LVL_REM_RAM2 = 0x200, LVL_REM_CCE1 = 0x400 *)
+  if Int64.(data_src land 0x08L <> 0L)
+  then L1_hit
+  else if Int64.(data_src land 0x20L <> 0L)
+  then L2_hit
+  else if Int64.(data_src land 0x40L <> 0L)
+  then L3_hit
+  else if Int64.(data_src land 0x80L <> 0L)
+  then Local_dram
+  else if Int64.(data_src land 0x700L <> 0L) (* REM_RAM1 | REM_RAM2 | REM_CCE1 *)
+  then Remote_dram
+  else Unknown
+;;
+
+type pebs_parsed =
+  { pebs_data : Event.Ok.Pebs_data.t
+  ; instruction_pointer : string
+  ; symbol_and_offset : string
+  }
+
+let parse_pebs_line line : pebs_parsed option =
+  match Re.exec_opt perf_pebs_line_re line with
+  | None -> None
+  | Some groups ->
+    let phys =
+      try Some (Int64.of_string ("0x" ^ Re.Group.get groups 6)) with
+      | _ -> None
+    in
+    let pebs_data =
+      { Event.Ok.Pebs_data.latency_cycles = Some (Int.of_string (Re.Group.get groups 3))
+      ; data_source =
+          Some (decode_data_source (Int64.of_string ("0x" ^ Re.Group.get groups 2)))
+      ; memory_address = Some (Int64.of_string ("0x" ^ Re.Group.get groups 1))
+      ; physical_address = phys
+      }
+    in
+    Some
+      { pebs_data
+      ; instruction_pointer = Re.Group.get groups 4
+      ; symbol_and_offset = Re.Group.get groups 5
+      }
+;;
+
 type header =
   | Trace_error
   | Event of
       { thread : Event.Thread.t
       ; time : Time_ns.Span.t
       ; period : int
-      ; event : [ `Branches | `Cbr | `Psb | `Cycles | `Branch_misses | `Cache_misses ]
+      ; event :
+          [ `Branches
+          | `Cbr
+          | `Psb
+          | `Cycles
+          | `Branch_misses
+          | `Cache_misses
+          | `Mem_loads
+          | `Mem_stores
+          ]
       ; remaining_line : string
       }
 
@@ -79,7 +157,7 @@ let parse_event_header line =
        ; time_lo
        ; period
        ; event_name
-       ; _event_config
+       ; event_config
        ; _event_selector
        ; _selector
        ; remaining_line
@@ -88,18 +166,36 @@ let parse_event_header line =
       let tid = maybe_pid_of_string tid in
       let time = parse_time ~time_hi ~time_lo in
       let period = Int.of_string period in
+      (* Event config contains the full event path like /mem_inst_retired.all_loads *)
+      let full_event =
+        if String.is_empty event_config
+        then event_name
+        else String.chop_prefix_if_exists event_config ~prefix:"/"
+      in
       let event =
-        match event_name with
-        | "branches" -> `Branches
-        | "cbr" -> `Cbr
-        | "psb" -> `Psb
-        | "cycles" -> `Cycles
-        | "branch-misses" -> `Branch_misses
-        | "cache-misses" -> `Cache_misses
+        match event_name, full_event with
+        | "branches", _ -> `Branches
+        | "cbr", _ -> `Cbr
+        | "psb", _ -> `Psb
+        | "cycles", _ -> `Cycles
+        | "branch-misses", _ -> `Branch_misses
+        | "cache-misses", _ -> `Cache_misses
+        | "mem_inst_retired", _ -> `Mem_loads
+        | _, event when String.is_substring event ~substring:"mem_inst_retired.all_loads" ->
+          `Mem_loads
+        | _, event when String.is_substring event ~substring:"mem_inst_retired.all_stores" ->
+          `Mem_stores
+        | "cpu_core", event when String.is_substring event ~substring:"mem_inst_retired" ->
+          (* Hybrid CPU format: cpu_core/mem_inst_retired.all_loads/... *)
+          if String.is_substring event ~substring:"all_stores"
+          then `Mem_stores
+          else `Mem_loads
         | _ ->
           raise_s
             [%message
-              "Unexpected event type when parsing perf output" (event_name : string)]
+              "Unexpected event type when parsing perf output"
+                (event_name : string)
+                (event_config : string)]
       in
       Event { thread = { pid; tid }; time; period; event; remaining_line }
     | results ->
@@ -329,7 +425,55 @@ let parse_perf_extra_sampled_event
   Ok
     { thread
     ; time
-    ; data = Event_sample { location; count = period; name }
+    ; data = Event_sample { location; count = period; name; pebs_data = None }
+    ; in_transaction = false
+    }
+;;
+
+let parse_perf_pebs_event
+  ?perf_maps
+  (thread : Event.Thread.t)
+  time
+  period
+  line
+  lines
+  name
+  : Event.t
+  =
+  let location, pebs_data =
+    match lines with
+    | [] ->
+      (match parse_pebs_line line with
+       | Some { pebs_data; instruction_pointer; symbol_and_offset } ->
+         let location =
+           parse_location ?perf_maps ~pid:thread.pid instruction_pointer symbol_and_offset
+         in
+         location, Some pebs_data
+       | None ->
+         (* Fallback to regular sampled event parsing if PEBS format doesn't match *)
+         (match Re.Group.all (Re.exec perf_extra_sampled_event_re line) with
+          | [| _str; _; instruction_pointer; symbol_and_offset |] ->
+            let location =
+              parse_location
+                ?perf_maps
+                ~pid:thread.pid
+                instruction_pointer
+                symbol_and_offset
+            in
+            location, None
+          | results ->
+            raise_s
+              [%message
+                "Regex of perf event did not match expected fields"
+                  (results : string array)]))
+    | lines ->
+      let location = List.hd_exn lines |> parse_callstack_entry ?perf_maps thread in
+      location, None
+  in
+  Ok
+    { thread
+    ; time
+    ; data = Event_sample { location; count = period; name; pebs_data }
     ; in_transaction = false
     }
 ;;
@@ -370,7 +514,27 @@ let to_event ?perf_maps lines : Event.t option =
                  period
                  remaining_line
                  lines
-                 Cache_misses)))
+                 Cache_misses)
+          | `Mem_loads ->
+            Some
+              (parse_perf_pebs_event
+                 ?perf_maps
+                 thread
+                 time
+                 period
+                 remaining_line
+                 lines
+                 Mem_loads)
+          | `Mem_stores ->
+            Some
+              (parse_perf_pebs_event
+                 ?perf_maps
+                 thread
+                 time
+                 period
+                 remaining_line
+                 lines
+                 Mem_stores)))
   with
   | exn ->
     raise_s
@@ -739,6 +903,40 @@ module%test _ = struct
            (data
             (Trace (trace_state_change End) (kind Async) (src 0x7f6fce0b71f4)
              (dst 0x0)))))) |}]
+  ;;
+
+  let%expect_test "PEBS mem-loads event without phys_addr" =
+    (* Actual perf script output format with PEBS fields *)
+    check
+      "1234/1234 1000.123456789:       1000 cpu_core/mem_inst_retired.all_loads,period=1000/uP:     \
+       7fff12345678      80 |OP LOAD|LVL N/A|SNP N/A|TLB N/A|LCK N/A|BLK  N/A               156               0               0     7f123456 malloc+0x20 (/lib64/libc.so.6)";
+    [%expect
+      {|
+      ((Ok
+        ((thread ((pid (1234)) (tid (1234)))) (time 16m40.123456789s)
+         (data
+          (Event_sample (location 0x7f123456) (count 1000) (name Mem_loads)
+           (pebs_data
+            ((latency_cycles (156)) (data_source (Local_dram))
+             (memory_address (0x7fff12345678)) (physical_address ()))))))))
+      |}]
+  ;;
+
+  let%expect_test "PEBS mem-loads event with phys_addr" =
+    (* Actual perf script output format with PEBS fields including phys_addr *)
+    check
+      "1234/1234 1000.123456789:       1000 cpu_core/mem_inst_retired.all_loads,period=1000/uP:     \
+       7fff12345678      8 |OP LOAD|LVL L1|SNP N/A|TLB N/A|LCK N/A|BLK  N/A               42               0               0     7f123456 malloc+0x20 (/lib64/libc.so.6)               123456789abc";
+    [%expect
+      {|
+      ((Ok
+        ((thread ((pid (1234)) (tid (1234)))) (time 16m40.123456789s)
+         (data
+          (Event_sample (location 0x7f123456) (count 1000) (name Mem_loads)
+           (pebs_data
+            ((latency_cycles (42)) (data_source (L1_hit))
+             (memory_address (0x7fff12345678)) (physical_address (0x123456789abc)))))))))
+      |}]
   ;;
 end
 
